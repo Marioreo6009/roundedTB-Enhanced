@@ -1,0 +1,19 @@
+# Ignore local .NET toolchain
+.dotnet/
+
+# Ignore local build outputs
+RoundedTB/RoundedTB/bin/
+RoundedTB/RoundedTB/obj/
+publish_temp/
+publish_out/
+RoundedTBEnhanced/
+
+# Ignore local standalone executable (since it is compiled by GitHub Actions on release)
+standalone.exe
+
+# Ignore local runtime settings and logs
+rtb.json
+rtb.log
+*.user
+*.suo
+.vs/
