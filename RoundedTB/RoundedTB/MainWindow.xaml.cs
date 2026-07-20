@@ -160,10 +160,26 @@ namespace RoundedTB
                 logPath = Path.Combine(Windows.Storage.ApplicationData.Current.RoamingFolder.Path, "rtb.log");
             }
 
-            if (System.IO.File.Exists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "RoundedTB.lnk")) && !IsRunningAsUWP())
+            if (!IsRunningAsUWP())
             {
-                StartupCheckBox.IsChecked = true;
-                ShowMenuItem.Header = "Show RoundedTB";
+                if (IsStartupEnabled())
+                {
+                    StartupCheckBox.IsChecked = true;
+                    // Repair existing shortcut/registry key to ensure it points to .exe with /autostart
+                    EnableStartup();
+                }
+
+                bool isAutostart = Environment.GetCommandLineArgs().Any(arg =>
+                    arg.Equals("/autostart", StringComparison.OrdinalIgnoreCase) ||
+                    arg.Equals("--autostart", StringComparison.OrdinalIgnoreCase) ||
+                    arg.Equals("-autostart", StringComparison.OrdinalIgnoreCase) ||
+                    arg.Equals("/startup", StringComparison.OrdinalIgnoreCase));
+
+                if (isAutostart)
+                {
+                    Visibility = Visibility.Hidden;
+                    ShowMenuItem.Header = "Show RoundedTB";
+                }
             }
             taskbarThread.WorkerSupportsCancellation = true;
             taskbarThread.WorkerReportsProgress = true;
@@ -641,19 +657,73 @@ namespace RoundedTB
             }
             else
             {
-                if (System.IO.File.Exists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "RoundedTB.lnk")))
+                if (IsStartupEnabled())
                 {
-                    System.IO.File.Delete(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "RoundedTB.lnk"));
+                    DisableStartup();
+                    StartupCheckBox.IsChecked = false;
                 }
                 else
                 {
                     EnableStartup();
+                    StartupCheckBox.IsChecked = true;
                 }
             }
         }
 
+        public string GetExecutablePath()
+        {
+            string exePath = Environment.ProcessPath;
+            if (string.IsNullOrEmpty(exePath) || !exePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
+                }
+                catch { }
+            }
+            if (string.IsNullOrEmpty(exePath) || !exePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                exePath = Environment.GetCommandLineArgs()[0];
+                if (exePath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                {
+                    exePath = exePath.Substring(0, exePath.Length - 4) + ".exe";
+                }
+            }
+            return exePath;
+        }
+
+        public bool IsStartupEnabled()
+        {
+            if (IsRunningAsUWP()) return false;
+
+            try
+            {
+                string shortcutFolder = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
+                string rtbStartupLink = Path.Combine(shortcutFolder, "RoundedTB.lnk");
+                if (System.IO.File.Exists(rtbStartupLink))
+                {
+                    return true;
+                }
+
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false))
+                {
+                    if (key != null && key.GetValue("RoundedTB") != null)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+            return false;
+        }
+
         public void EnableStartup()
         {
+            string exePath = GetExecutablePath();
+
+            // 1. Create Shell Shortcut in Startup folder
             try
             {
                 string shortcutFolder = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
@@ -662,17 +732,72 @@ namespace RoundedTB
                     Directory.CreateDirectory(shortcutFolder);
                 }
                 Type t = Type.GetTypeFromProgID("WScript.Shell");
-                dynamic shellClass = Activator.CreateInstance(t);
-                string rtbStartupLink = Path.Combine(shortcutFolder, "RoundedTB.lnk");
-                dynamic shortcut = shellClass.CreateShortcut(rtbStartupLink);
-                shortcut.TargetPath = Environment.GetCommandLineArgs()[0];
-                shortcut.IconLocation = Environment.GetCommandLineArgs()[0];
-                shortcut.Arguments = "";
-                shortcut.Description = "Start RoundedTB";
-                shortcut.Save();
+                if (t != null)
+                {
+                    dynamic shellClass = Activator.CreateInstance(t);
+                    string rtbStartupLink = Path.Combine(shortcutFolder, "RoundedTB.lnk");
+                    dynamic shortcut = shellClass.CreateShortcut(rtbStartupLink);
+                    shortcut.TargetPath = exePath;
+                    shortcut.IconLocation = exePath;
+                    shortcut.Arguments = "/autostart";
+                    shortcut.WorkingDirectory = Path.GetDirectoryName(exePath);
+                    shortcut.Description = "Start RoundedTB";
+                    shortcut.Save();
+                }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                try { interaction?.AddLog($"Failed to create startup shortcut: {ex.Message}"); } catch { }
+            }
+
+            // 2. HKCU Registry Run Key (ensures startup even if shell shortcut creation/execution fails)
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("RoundedTB", $"\"{exePath}\" /autostart");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                try { interaction?.AddLog($"Failed to set startup registry key: {ex.Message}"); } catch { }
+            }
+        }
+
+        public void DisableStartup()
+        {
+            // 1. Delete Startup shortcut
+            try
+            {
+                string shortcutFolder = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
+                string rtbStartupLink = Path.Combine(shortcutFolder, "RoundedTB.lnk");
+                if (System.IO.File.Exists(rtbStartupLink))
+                {
+                    System.IO.File.Delete(rtbStartupLink);
+                }
+            }
+            catch (Exception ex)
+            {
+                try { interaction?.AddLog($"Failed to delete startup shortcut: {ex.Message}"); } catch { }
+            }
+
+            // 2. Delete HKCU Registry Run Key
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true))
+                {
+                    if (key != null && key.GetValue("RoundedTB") != null)
+                    {
+                        key.DeleteValue("RoundedTB", false);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                try { interaction?.AddLog($"Failed to delete startup registry key: {ex.Message}"); } catch { }
             }
         }
 
